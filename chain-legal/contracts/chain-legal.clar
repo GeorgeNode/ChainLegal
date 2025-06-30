@@ -218,3 +218,272 @@
         (ok contract-id)
     )
 )
+
+;; =====================================================
+;; CHAINLEGAL: SMART CONTRACT LEGAL FRAMEWORK
+;; =====================================================
+
+;; Compliance Rules
+(define-map compliance-rules
+    {
+        jurisdiction: (string-ascii 8),
+        contract-type: (string-ascii 32),
+    }
+    {
+        min-signature-requirements: uint,
+        witness-required: bool,
+        notarization-required: bool,
+        cooling-period: uint,
+        max-contract-value: uint,
+    }
+)
+
+;; Initialize compliance rules
+(map-set compliance-rules {
+    jurisdiction: "US-NY",
+    contract-type: "employment",
+} {
+    min-signature-requirements: u2,
+    witness-required: false,
+    notarization-required: false,
+    cooling-period: u144,
+    max-contract-value: u0,
+})
+
+;; ~24 hours cooling period
+
+(map-set compliance-rules {
+    jurisdiction: "US-NY",
+    contract-type: "real-estate",
+} {
+    min-signature-requirements: u2,
+    witness-required: true,
+    notarization-required: true,
+    cooling-period: u1008,
+    max-contract-value: u0,
+})
+
+;; ~7 days cooling period
+
+(map-set compliance-rules {
+    jurisdiction: "UK-ENG",
+    contract-type: "commercial",
+} {
+    min-signature-requirements: u2,
+    witness-required: false,
+    notarization-required: false,
+    cooling-period: u72,
+    max-contract-value: u0,
+})
+
+;; ~12 hours cooling period
+
+;; Digital Signature Functions
+(define-public (sign-contract
+        (contract-id uint)
+        (signature-hash (string-ascii 64))
+        (witness (optional principal))
+    )
+    (let (
+            (contract-data (unwrap! (get-legal-contract contract-id) ERR_CONTRACT_NOT_FOUND))
+            (current-sigs (get current-signatures contract-data))
+        )
+        ;; Validate signer is a party to the contract
+        (asserts! (is-some (index-of (get parties contract-data) tx-sender))
+            ERR_INVALID_PARTY
+        )
+        ;; Check contract hasn't expired
+        (asserts! (< stacks-block-height (get expires-at contract-data))
+            ERR_CONTRACT_EXPIRED
+        )
+        ;; Check if already signed
+        (asserts!
+            (is-none (map-get? contract-signatures {
+                contract-id: contract-id,
+                signer: tx-sender,
+            }))
+            ERR_CONTRACT_ALREADY_SIGNED
+        )
+        ;; Record signature
+        (map-set contract-signatures {
+            contract-id: contract-id,
+            signer: tx-sender,
+        } {
+            signed-at: stacks-block-height,
+            signature-hash: signature-hash,
+            witness: witness,
+            is-notarized: false,
+        })
+        ;; Update signature count
+        (map-set legal-contracts { contract-id: contract-id }
+            (merge contract-data { current-signatures: (+ current-sigs u1) })
+        )
+        ;; Check if contract is fully signed
+        (if (>= (+ current-sigs u1) (get required-signatures contract-data))
+            (begin
+                (try! (finalize-contract contract-id))
+                (ok "contract-signed-and-finalized")
+            )
+            (ok "signature-recorded")
+        )
+    )
+)
+
+(define-public (notarize-signature
+        (contract-id uint)
+        (signer principal)
+    )
+    (let (
+            (signature-data (unwrap!
+                (map-get? contract-signatures {
+                    contract-id: contract-id,
+                    signer: signer,
+                })
+                ERR_CONTRACT_NOT_FOUND
+            ))
+            (contract-data (unwrap! (get-legal-contract contract-id) ERR_CONTRACT_NOT_FOUND))
+        )
+        ;; Only verified legal entities can notarize
+        (asserts!
+            (default-to false (get is-verified (get-legal-entity tx-sender)))
+            ERR_UNAUTHORIZED
+        )
+        ;; Update notarization status
+        (map-set contract-signatures {
+            contract-id: contract-id,
+            signer: signer,
+        }
+            (merge signature-data { is-notarized: true })
+        )
+        (ok true)
+    )
+)
+
+;; Compliance Validation
+(define-read-only (check-compliance (contract-id uint))
+    (match (get-legal-contract contract-id)
+        contract-data
+        (let (
+                (jurisdiction (get jurisdiction contract-data))
+                (contract-type (get contract-type contract-data))
+                (compliance-rule (map-get? compliance-rules {
+                    jurisdiction: jurisdiction,
+                    contract-type: contract-type,
+                }))
+            )
+            (match compliance-rule
+                rule
+                {
+                    signatures-met: (>= (get current-signatures contract-data)
+                        (get min-signature-requirements rule)
+                    ),
+                    witness-requirement-met: (if (get witness-required rule)
+                        (check-witness-requirements contract-id)
+                        true
+                    ),
+                    notarization-requirement-met: (if (get notarization-required rule)
+                        (check-notarization-requirements contract-id)
+                        true
+                    ),
+                    value-limit-met: (if (> (get max-contract-value rule) u0)
+                        (<= (get total-value contract-data)
+                            (get max-contract-value rule)
+                        )
+                        true
+                    ),
+                }
+                ;; Default compliance if no specific rules
+                {
+                    signatures-met: (>= (get current-signatures contract-data)
+                        (get required-signatures contract-data)
+                    ),
+                    witness-requirement-met: true,
+                    notarization-requirement-met: true,
+                    value-limit-met: true,
+                }
+            )
+        )
+        ;; Return default failure state if contract not found
+        {
+            signatures-met: false,
+            witness-requirement-met: false,
+            notarization-requirement-met: false,
+            value-limit-met: false,
+        }
+    )
+)
+
+(define-private (check-witness-requirements (contract-id uint))
+    ;; Simplified witness check - in production, this would verify witness signatures
+    true
+)
+
+(define-private (check-notarization-requirements (contract-id uint))
+    ;; Check if all required signatures are notarized
+    (let ((contract-data (unwrap! (get-legal-contract contract-id) false)))
+        ;; For now, return true - in production, iterate through signatures
+        true
+    )
+)
+
+(define-private (finalize-contract (contract-id uint))
+    (let (
+            (contract-data (unwrap! (get-legal-contract contract-id) ERR_CONTRACT_NOT_FOUND))
+            (compliance-check (check-compliance contract-id))
+        )
+        ;; Verify compliance before finalizing
+        (asserts! (get signatures-met compliance-check)
+            ERR_INSUFFICIENT_SIGNATURES
+        )
+        (asserts! (get witness-requirement-met compliance-check) ERR_UNAUTHORIZED)
+        (asserts! (get notarization-requirement-met compliance-check)
+            ERR_UNAUTHORIZED
+        )
+        (asserts! (get value-limit-met compliance-check) ERR_UNAUTHORIZED)
+        ;; Update contract status
+        (map-set legal-contracts { contract-id: contract-id }
+            (merge contract-data { status: "active" })
+        )
+        (ok true)
+    )
+)
+
+;; Entity Verification
+(define-public (register-legal-entity
+        (entity-type (string-ascii 16))
+        (jurisdiction (string-ascii 8))
+        (registration-number (string-ascii 32))
+        (legal-name (string-ascii 128))
+    )
+    (begin
+        ;; Validate jurisdiction
+        (asserts! (is-jurisdiction-supported jurisdiction)
+            ERR_INVALID_JURISDICTION
+        )
+        ;; Register entity
+        (map-set legal-entities { entity: tx-sender } {
+            entity-type: entity-type,
+            jurisdiction: jurisdiction,
+            registration-number: registration-number,
+            verified-at: stacks-block-height,
+            is-verified: false,
+            legal-name: legal-name,
+        })
+        (ok true)
+    )
+)
+
+(define-public (verify-legal-entity (entity principal))
+    (let ((entity-data (unwrap! (get-legal-entity entity) ERR_CONTRACT_NOT_FOUND)))
+        ;; Only contract owner can verify entities
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
+        ;; Update verification status
+        (map-set legal-entities { entity: entity }
+            (merge entity-data {
+                is-verified: true,
+                verified-at: stacks-block-height,
+            })
+        )
+        (ok true)
+    )
+)
