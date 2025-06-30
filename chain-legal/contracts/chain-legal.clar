@@ -1,5 +1,6 @@
 ;; =====================================================
 ;; CHAINLEGAL: SMART CONTRACT LEGAL FRAMEWORK
+;; Core Legal Framework & Contract Management
 ;; =====================================================
 
 ;; Constants
@@ -220,7 +221,7 @@
 )
 
 ;; =====================================================
-;; CHAINLEGAL: SMART CONTRACT LEGAL FRAMEWORK
+;; Digital Signatures & Compliance Validation
 ;; =====================================================
 
 ;; Compliance Rules
@@ -484,6 +485,299 @@
                 verified-at: stacks-block-height,
             })
         )
+        (ok true)
+    )
+)
+
+;; =====================================================
+;;  Dispute Resolution & Legal Enforcement
+;; =====================================================
+
+;; Dispute Management
+(define-map disputes
+    { dispute-id: uint }
+    {
+        contract-id: uint,
+        plaintiff: principal,
+        defendant: principal,
+        dispute-type: (string-ascii 32),
+        filed-at: uint,
+        status: (string-ascii 16),
+        arbitrator: (optional principal),
+        resolution: (optional (string-ascii 256)),
+        resolution-date: (optional uint),
+        evidence-hash: (string-ascii 64),
+    }
+)
+
+(define-map arbitrators
+    { arbitrator: principal }
+    {
+        jurisdiction: (string-ascii 8),
+        specialization: (string-ascii 32),
+        cases-resolved: uint,
+        success-rate: uint,
+        is-active: bool,
+        certification-hash: (string-ascii 64),
+    }
+)
+
+(define-data-var next-dispute-id uint u1)
+
+;; Contract Enforcement Actions
+(define-map enforcement-actions
+    { action-id: uint }
+    {
+        contract-id: uint,
+        action-type: (string-ascii 32),
+        initiated-by: principal,
+        target-party: principal,
+        amount: uint,
+        deadline: uint,
+        status: (string-ascii 16),
+        completion-proof: (optional (string-ascii 64)),
+    }
+)
+
+(define-data-var next-action-id uint u1)
+
+;; Dispute Resolution Functions
+(define-public (file-dispute
+        (contract-id uint)
+        (defendant principal)
+        (dispute-type (string-ascii 32))
+        (evidence-hash (string-ascii 64))
+    )
+    (let (
+            (dispute-id (var-get next-dispute-id))
+            (contract-data (unwrap! (get-legal-contract contract-id) ERR_CONTRACT_NOT_FOUND))
+        )
+        ;; Validate that both parties are in the contract
+        (asserts! (is-some (index-of (get parties contract-data) tx-sender))
+            ERR_INVALID_PARTY
+        )
+        (asserts! (is-some (index-of (get parties contract-data) defendant))
+            ERR_INVALID_PARTY
+        )
+        ;; Contract must be active to file dispute
+        (asserts! (is-eq (get status contract-data) "active")
+            ERR_CONTRACT_NOT_FOUND
+        )
+        ;; Create dispute record
+        (map-set disputes { dispute-id: dispute-id } {
+            contract-id: contract-id,
+            plaintiff: tx-sender,
+            defendant: defendant,
+            dispute-type: dispute-type,
+            filed-at: stacks-block-height,
+            status: "filed",
+            arbitrator: none,
+            resolution: none,
+            resolution-date: none,
+            evidence-hash: evidence-hash,
+        })
+        ;; Update contract status to disputed
+        (map-set legal-contracts { contract-id: contract-id }
+            (merge contract-data { status: "disputed" })
+        )
+        ;; Increment dispute counter
+        (var-set next-dispute-id (+ dispute-id u1))
+        (ok dispute-id)
+    )
+)
+
+(define-public (assign-arbitrator
+        (dispute-id uint)
+        (arbitrator principal)
+    )
+    (let (
+            (dispute-data (unwrap! (map-get? disputes { dispute-id: dispute-id })
+                ERR_CONTRACT_NOT_FOUND
+            ))
+            (arbitrator-data (unwrap! (map-get? arbitrators { arbitrator: arbitrator })
+                ERR_UNAUTHORIZED
+            ))
+        )
+        ;; Only contract owner or dispute parties can assign arbitrator
+        (asserts!
+            (or
+                (is-eq tx-sender (var-get contract-owner))
+                (is-eq tx-sender (get plaintiff dispute-data))
+                (is-eq tx-sender (get defendant dispute-data))
+            )
+            ERR_UNAUTHORIZED
+        )
+        ;; Arbitrator must be active
+        (asserts! (get is-active arbitrator-data) ERR_UNAUTHORIZED)
+        ;; Update dispute with arbitrator
+        (map-set disputes { dispute-id: dispute-id }
+            (merge dispute-data {
+                arbitrator: (some arbitrator),
+                status: "arbitration",
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (resolve-dispute
+        (dispute-id uint)
+        (resolution (string-ascii 256))
+        (winning-party principal)
+    )
+    (let (
+            (dispute-data (unwrap! (map-get? disputes { dispute-id: dispute-id })
+                ERR_CONTRACT_NOT_FOUND
+            ))
+            (arbitrator (unwrap! (get arbitrator dispute-data) ERR_UNAUTHORIZED))
+        )
+        ;; Only assigned arbitrator can resolve
+        (asserts! (is-eq tx-sender arbitrator) ERR_UNAUTHORIZED)
+        ;; Validate winning party is either plaintiff or defendant
+        (asserts!
+            (or
+                (is-eq winning-party (get plaintiff dispute-data))
+                (is-eq winning-party (get defendant dispute-data))
+            )
+            ERR_INVALID_PARTY
+        )
+        ;; Update dispute resolution
+        (map-set disputes { dispute-id: dispute-id }
+            (merge dispute-data {
+                status: "resolved",
+                resolution: (some resolution),
+                resolution-date: (some stacks-block-height),
+            })
+        )
+        ;; Update arbitrator stats
+        (let ((arb-data (unwrap! (map-get? arbitrators { arbitrator: arbitrator })
+                ERR_CONTRACT_NOT_FOUND
+            )))
+            (map-set arbitrators { arbitrator: arbitrator }
+                (merge arb-data { cases-resolved: (+ (get cases-resolved arb-data) u1) })
+            )
+        )
+        (ok true)
+    )
+)
+
+;; Enforcement Functions
+(define-public (initiate-enforcement
+        (contract-id uint)
+        (target-party principal)
+        (action-type (string-ascii 32))
+        (amount uint)
+        (deadline uint)
+    )
+    (let (
+            (action-id (var-get next-action-id))
+            (contract-data (unwrap! (get-legal-contract contract-id) ERR_CONTRACT_NOT_FOUND))
+        )
+        ;; Only contract parties can initiate enforcement
+        (asserts! (is-some (index-of (get parties contract-data) tx-sender))
+            ERR_INVALID_PARTY
+        )
+        (asserts! (is-some (index-of (get parties contract-data) target-party))
+            ERR_INVALID_PARTY
+        )
+        ;; Contract must be active
+        (asserts! (is-eq (get status contract-data) "active")
+            ERR_CONTRACT_NOT_FOUND
+        )
+        ;; Create enforcement action
+        (map-set enforcement-actions { action-id: action-id } {
+            contract-id: contract-id,
+            action-type: action-type,
+            initiated-by: tx-sender,
+            target-party: target-party,
+            amount: amount,
+            deadline: deadline,
+            status: "pending",
+            completion-proof: none,
+        })
+        ;; Increment action counter
+        (var-set next-action-id (+ action-id u1))
+        (ok action-id)
+    )
+)
+
+;; Read-only Query Functions
+(define-read-only (get-dispute (dispute-id uint))
+    (map-get? disputes { dispute-id: dispute-id })
+)
+
+(define-read-only (get-enforcement-action (action-id uint))
+    (map-get? enforcement-actions { action-id: action-id })
+)
+
+(define-read-only (get-contract-status (contract-id uint))
+    (match (get-legal-contract contract-id)
+        contract
+        {
+            status: (get status contract),
+            signatures: (get current-signatures contract),
+            required-signatures: (get required-signatures contract),
+            expires-at: (get expires-at contract),
+            is-compliant: (check-compliance contract-id),
+        }
+        {
+            status: "not-found",
+            signatures: u0,
+            required-signatures: u0,
+            expires-at: u0,
+            is-compliant: {
+                signatures-met: false,
+                witness-requirement-met: false,
+                notarization-requirement-met: false,
+                value-limit-met: false,
+            },
+        }
+    )
+)
+
+;; Administrative Functions
+(define-public (register-arbitrator
+        (jurisdiction (string-ascii 8))
+        (specialization (string-ascii 32))
+        (certification-hash (string-ascii 64))
+    )
+    (begin
+        ;; Validate jurisdiction
+        (asserts! (is-jurisdiction-supported jurisdiction)
+            ERR_INVALID_JURISDICTION
+        )
+        ;; Register arbitrator
+        (map-set arbitrators { arbitrator: tx-sender } {
+            jurisdiction: jurisdiction,
+            specialization: specialization,
+            cases-resolved: u0,
+            success-rate: u100,
+            is-active: false,
+            certification-hash: certification-hash,
+        })
+        (ok true)
+    )
+)
+
+(define-public (activate-arbitrator (arbitrator principal))
+    (let ((arb-data (unwrap! (map-get? arbitrators { arbitrator: arbitrator })
+            ERR_CONTRACT_NOT_FOUND
+        )))
+        ;; Only contract owner can activate arbitrators
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
+        ;; Activate arbitrator
+        (map-set arbitrators { arbitrator: arbitrator }
+            (merge arb-data { is-active: true })
+        )
+        (ok true)
+    )
+)
+
+(define-public (set-platform-fee (new-fee-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
+        (asserts! (<= new-fee-rate u1000) ERR_UNAUTHORIZED) ;; Max 10%
+        (var-set platform-fee-rate new-fee-rate)
         (ok true)
     )
 )
