@@ -642,3 +642,519 @@ describe("ChainLegal Core Contract Management", () => {
     });
   });
 });
+
+describe("ChainLegal Digital Signatures & Compliance", () => {
+  let contractId: number;
+  let templateId: number;
+
+  beforeEach(() => {
+    // Create a template and contract for signature testing
+    const templateResult = simnet.callPublicFn(
+      contractName,
+      "create-contract-template",
+      [
+        Cl.stringAscii("Signature Test Template"),
+        Cl.stringAscii("employment"),
+        Cl.stringAscii("US-NY"),
+        Cl.stringAscii("template-hash-sig"),
+        Cl.stringAscii("standard")
+      ],
+      wallet1
+    );
+    templateId = 1;
+
+    const parties = [wallet1, wallet2, wallet3];
+    const expiresAt = simnet.blockHeight + 1000;
+    
+    const contractResult = simnet.callPublicFn(
+      contractName,
+      "create-legal-contract",
+      [
+        Cl.uint(templateId),
+        Cl.list(parties.map(p => Cl.principal(p))),
+        Cl.stringAscii("US-NY"),
+        Cl.stringAscii("employment"),
+        Cl.uint(expiresAt),
+        Cl.stringAscii("contract-terms-hash"),
+        Cl.stringAscii("https://example.com/contract"),
+        Cl.uint(75000),
+        Cl.uint(2)
+      ],
+      wallet1
+    );
+    contractId = 1;
+  });
+
+  describe("Contract Signing", () => {
+    it("should allow valid party to sign contract", () => {
+      const { result } = simnet.callPublicFn(
+        contractName,
+        "sign-contract",
+        [
+          Cl.uint(contractId),
+          Cl.stringAscii("signature-hash-wallet1"),
+          Cl.none()
+        ],
+        wallet1
+      );
+      expect(result).toBeOk(Cl.stringAscii("signature-recorded"));
+    });
+
+    it("should allow signing with witness", () => {
+      const { result } = simnet.callPublicFn(
+        contractName,
+        "sign-contract",
+        [
+          Cl.uint(contractId),
+          Cl.stringAscii("signature-hash-wallet2"),
+          Cl.some(Cl.principal(wallet4))
+        ],
+        wallet2
+      );
+      expect(result).toBeOk(Cl.stringAscii("signature-recorded"));
+    });
+
+    it("should prevent non-party from signing", () => {
+      const { result } = simnet.callPublicFn(
+        contractName,
+        "sign-contract",
+        [
+          Cl.uint(contractId),
+          Cl.stringAscii("invalid-signature"),
+          Cl.none()
+        ],
+        wallet4 // Not a party to the contract
+      );
+      expect(result).toBeErr(Cl.uint(406)); // ERR_INVALID_PARTY
+    });
+
+    it("should prevent double signing by same party", () => {
+      // First signature
+      simnet.callPublicFn(
+        contractName,
+        "sign-contract",
+        [
+          Cl.uint(contractId),
+          Cl.stringAscii("first-signature"),
+          Cl.none()
+        ],
+        wallet1
+      );
+
+      // Attempt second signature
+      const { result } = simnet.callPublicFn(
+        contractName,
+        "sign-contract",
+        [
+          Cl.uint(contractId),
+          Cl.stringAscii("second-signature"),
+          Cl.none()
+        ],
+        wallet1
+      );
+      expect(result).toBeErr(Cl.uint(404)); // ERR_CONTRACT_ALREADY_SIGNED
+    });
+
+    it("should prevent signing expired contract", () => {
+      // Create contract with very short expiration
+      const currentBlockHeight = simnet.blockHeight;
+      simnet.callPublicFn(
+        contractName,
+        "create-legal-contract",
+        [
+          Cl.uint(templateId),
+          Cl.list([Cl.principal(wallet1), Cl.principal(wallet2)]),
+          Cl.stringAscii("US-NY"),
+          Cl.stringAscii("employment"),
+          Cl.uint(currentBlockHeight + 2), // Expires in 2 blocks
+          Cl.stringAscii("expired-contract-terms"),
+          Cl.stringAscii("https://example.com/expired"),
+          Cl.uint(50000),
+          Cl.uint(2)
+        ],
+        wallet1
+      );
+      const expiredContractId = 2;
+
+      // Advance time to expire the contract
+      simnet.mineEmptyBlocks(5);
+
+      const { result } = simnet.callPublicFn(
+        contractName,
+        "sign-contract",
+        [
+          Cl.uint(expiredContractId),
+          Cl.stringAscii("too-late-signature"),
+          Cl.none()
+        ],
+        wallet1
+      );
+      expect(result).toBeErr(Cl.uint(405)); // ERR_CONTRACT_EXPIRED
+    });
+
+    it("should finalize contract when all required signatures collected", () => {
+      // First signature
+      simnet.callPublicFn(
+        contractName,
+        "sign-contract",
+        [
+          Cl.uint(contractId),
+          Cl.stringAscii("signature-1"),
+          Cl.none()
+        ],
+        wallet1
+      );
+
+      // Second signature should finalize
+      const { result } = simnet.callPublicFn(
+        contractName,
+        "sign-contract",
+        [
+          Cl.uint(contractId),
+          Cl.stringAscii("signature-2"),
+          Cl.none()
+        ],
+        wallet2
+      );
+      expect(result).toBeOk(Cl.stringAscii("contract-signed-and-finalized"));
+
+      // Check contract status - focus on the key status fields
+      const { result: statusResult } = simnet.callReadOnlyFn(
+        contractName,
+        "get-contract-status",
+        [Cl.uint(contractId)],
+        deployer
+      );
+      
+      // Verify the essential contract finalization data
+      const status = statusResult as any;
+      expect(status.data.status).toBeAscii("active");
+      expect(status.data.signatures).toBeUint(2);
+      expect(status.data["required-signatures"]).toBeUint(2);
+      expect(status.data["is-compliant"].data["signatures-met"]).toBeBool(true);
+      expect(status.data["is-compliant"].data["witness-requirement-met"]).toBeBool(true);
+      expect(status.data["is-compliant"].data["notarization-requirement-met"]).toBeBool(true);
+      expect(status.data["is-compliant"].data["value-limit-met"]).toBeBool(true);
+    });
+
+    it("should prevent signing non-existent contract", () => {
+      const { result } = simnet.callPublicFn(
+        contractName,
+        "sign-contract",
+        [
+          Cl.uint(999), // Non-existent contract
+          Cl.stringAscii("invalid-signature"),
+          Cl.none()
+        ],
+        wallet1
+      );
+      expect(result).toBeErr(Cl.uint(402)); // ERR_CONTRACT_NOT_FOUND
+    });
+  });
+
+  describe("Notarization", () => {
+    beforeEach(() => {
+      // Register a legal entity for notarization
+      simnet.callPublicFn(
+        contractName,
+        "register-legal-entity",
+        [
+          Cl.stringAscii("notary"),
+          Cl.stringAscii("US-NY"),
+          Cl.stringAscii("NOTARY123"),
+          Cl.stringAscii("Professional Notary Services")
+        ],
+        wallet4
+      );
+
+      // Verify the notary entity
+      simnet.callPublicFn(
+        contractName,
+        "verify-legal-entity",
+        [Cl.principal(wallet4)],
+        deployer
+      );
+
+      // Have wallet1 sign the contract first
+      simnet.callPublicFn(
+        contractName,
+        "sign-contract",
+        [
+          Cl.uint(contractId),
+          Cl.stringAscii("signature-for-notarization"),
+          Cl.none()
+        ],
+        wallet1
+      );
+    });
+
+    it("should allow verified entity to notarize signature", () => {
+      const { result } = simnet.callPublicFn(
+        contractName,
+        "notarize-signature",
+        [
+          Cl.uint(contractId),
+          Cl.principal(wallet1)
+        ],
+        wallet4
+      );
+      expect(result).toBeOk(Cl.bool(true));
+    });
+
+    it("should prevent unverified entity from notarizing", () => {
+      const { result } = simnet.callPublicFn(
+        contractName,
+        "notarize-signature",
+        [
+          Cl.uint(contractId),
+          Cl.principal(wallet1)
+        ],
+        wallet2 // Not a verified entity
+      );
+      expect(result).toBeErr(Cl.uint(401)); // ERR_UNAUTHORIZED
+    });
+
+    it("should prevent notarizing non-existent signature", () => {
+      const { result } = simnet.callPublicFn(
+        contractName,
+        "notarize-signature",
+        [
+          Cl.uint(contractId),
+          Cl.principal(wallet3) // wallet3 hasn't signed
+        ],
+        wallet4
+      );
+      expect(result).toBeErr(Cl.uint(402)); // ERR_CONTRACT_NOT_FOUND
+    });
+  });
+
+  describe("Compliance Validation", () => {
+    it("should check compliance for unsigned contract", () => {
+      const { result } = simnet.callReadOnlyFn(
+        contractName,
+        "check-compliance",
+        [Cl.uint(contractId)],
+        deployer
+      );
+
+      expect(result).toBeTuple({
+        "signatures-met": Cl.bool(false),
+        "witness-requirement-met": Cl.bool(true),
+        "notarization-requirement-met": Cl.bool(true),
+        "value-limit-met": Cl.bool(true),
+      });
+    });
+
+    it("should check compliance for partially signed contract", () => {
+      // Sign with one party
+      simnet.callPublicFn(
+        contractName,
+        "sign-contract",
+        [
+          Cl.uint(contractId),
+          Cl.stringAscii("partial-signature"),
+          Cl.none()
+        ],
+        wallet1
+      );
+
+      const { result } = simnet.callReadOnlyFn(
+        contractName,
+        "check-compliance",
+        [Cl.uint(contractId)],
+        deployer
+      );
+
+      expect(result).toBeTuple({
+        "signatures-met": Cl.bool(false), // Still needs one more signature
+        "witness-requirement-met": Cl.bool(true),
+        "notarization-requirement-met": Cl.bool(true),
+        "value-limit-met": Cl.bool(true),
+      });
+    });
+
+    it("should check compliance for fully signed contract", () => {
+      // Sign with both required parties
+      simnet.callPublicFn(
+        contractName,
+        "sign-contract",
+        [
+          Cl.uint(contractId),
+          Cl.stringAscii("signature-1"),
+          Cl.none()
+        ],
+        wallet1
+      );
+
+      simnet.callPublicFn(
+        contractName,
+        "sign-contract",
+        [
+          Cl.uint(contractId),
+          Cl.stringAscii("signature-2"),
+          Cl.none()
+        ],
+        wallet2
+      );
+
+      const { result } = simnet.callReadOnlyFn(
+        contractName,
+        "check-compliance",
+        [Cl.uint(contractId)],
+        deployer
+      );
+
+      expect(result).toBeTuple({
+        "signatures-met": Cl.bool(true),
+        "witness-requirement-met": Cl.bool(true),
+        "notarization-requirement-met": Cl.bool(true),
+        "value-limit-met": Cl.bool(true),
+      });
+    });
+
+    it("should return default compliance for non-existent contract", () => {
+      const { result } = simnet.callReadOnlyFn(
+        contractName,
+        "check-compliance",
+        [Cl.uint(999)],
+        deployer
+      );
+
+      expect(result).toBeTuple({
+        "signatures-met": Cl.bool(false),
+        "witness-requirement-met": Cl.bool(false),
+        "notarization-requirement-met": Cl.bool(false),
+        "value-limit-met": Cl.bool(false),
+      });
+    });
+  });
+
+  describe("Arbitrator Management", () => {
+    it("should register arbitrator successfully", () => {
+      const { result } = simnet.callPublicFn(
+        contractName,
+        "register-arbitrator",
+        [
+          Cl.stringAscii("US-NY"),
+          Cl.stringAscii("commercial-disputes"),
+          Cl.stringAscii("arbitrator-cert-hash")
+        ],
+        wallet4
+      );
+      expect(result).toBeOk(Cl.bool(true));
+    });
+
+    it("should fail to register arbitrator with invalid jurisdiction", () => {
+      const { result } = simnet.callPublicFn(
+        contractName,
+        "register-arbitrator",
+        [
+          Cl.stringAscii("INVALID"),
+          Cl.stringAscii("commercial-disputes"),
+          Cl.stringAscii("arbitrator-cert-hash")
+        ],
+        wallet4
+      );
+      expect(result).toBeErr(Cl.uint(403)); // ERR_INVALID_JURISDICTION
+    });
+
+    it("should allow contract owner to activate arbitrator", () => {
+      // Register arbitrator first
+      simnet.callPublicFn(
+        contractName,
+        "register-arbitrator",
+        [
+          Cl.stringAscii("UK-ENG"),
+          Cl.stringAscii("employment-law"),
+          Cl.stringAscii("uk-arbitrator-cert")
+        ],
+        wallet4
+      );
+
+      // Activate by contract owner
+      const { result } = simnet.callPublicFn(
+        contractName,
+        "activate-arbitrator",
+        [Cl.principal(wallet4)],
+        deployer
+      );
+      expect(result).toBeOk(Cl.bool(true));
+    });
+
+    it("should prevent non-owner from activating arbitrator", () => {
+      // Register arbitrator first
+      simnet.callPublicFn(
+        contractName,
+        "register-arbitrator",
+        [
+          Cl.stringAscii("DE-BW"),
+          Cl.stringAscii("contract-law"),
+          Cl.stringAscii("de-arbitrator-cert")
+        ],
+        wallet4
+      );
+
+      // Try to activate by non-owner
+      const { result } = simnet.callPublicFn(
+        contractName,
+        "activate-arbitrator",
+        [Cl.principal(wallet4)],
+        wallet1
+      );
+      expect(result).toBeErr(Cl.uint(401)); // ERR_UNAUTHORIZED
+    });
+
+    it("should fail to activate non-existent arbitrator", () => {
+      const { result } = simnet.callPublicFn(
+        contractName,
+        "activate-arbitrator",
+        [Cl.principal(wallet3)], // Not registered as arbitrator
+        deployer
+      );
+      expect(result).toBeErr(Cl.uint(402)); // ERR_CONTRACT_NOT_FOUND
+    });
+  });
+
+  describe("Platform Fee Management", () => {
+    it("should allow contract owner to set platform fee", () => {
+      const { result } = simnet.callPublicFn(
+        contractName,
+        "set-platform-fee",
+        [Cl.uint(500)], // 5%
+        deployer
+      );
+      expect(result).toBeOk(Cl.bool(true));
+    });
+
+    it("should prevent non-owner from setting platform fee", () => {
+      const { result } = simnet.callPublicFn(
+        contractName,
+        "set-platform-fee",
+        [Cl.uint(300)],
+        wallet1
+      );
+      expect(result).toBeErr(Cl.uint(401)); // ERR_UNAUTHORIZED
+    });
+
+    it("should prevent setting excessive platform fee", () => {
+      const { result } = simnet.callPublicFn(
+        contractName,
+        "set-platform-fee",
+        [Cl.uint(1500)], // 15% - exceeds 10% maximum
+        deployer
+      );
+      expect(result).toBeErr(Cl.uint(401)); // ERR_UNAUTHORIZED
+    });
+
+    it("should allow setting platform fee at maximum limit", () => {
+      const { result } = simnet.callPublicFn(
+        contractName,
+        "set-platform-fee",
+        [Cl.uint(1000)], // 10% - at maximum
+        deployer
+      );
+      expect(result).toBeOk(Cl.bool(true));
+    });
+  });
+});
+
